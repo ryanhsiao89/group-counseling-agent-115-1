@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections import defaultdict
 from typing import Any, Mapping
@@ -186,16 +187,40 @@ class GoogleSheetsStore(BaseStore):
 
 
 def create_store(secrets: Mapping[str, Any] | None) -> BaseStore:
+    """依 Secrets 建立資料層，並相容新舊兩種服務帳戶格式。
+
+    支援：
+    1. 新版 TOML 表格：``[gcp_service_account]``
+    2. 舊版整份 JSON：``GOOGLE_SERVICE_ACCOUNT_JSON = '''{...}'''``
+    """
     if secrets is None:
         return InMemoryStore()
-    try:
-        settings = dict(secrets.get("google_sheets", {}))
-        service_account = dict(secrets.get("gcp_service_account", {}))
-        spreadsheet_id = str(settings.get("spreadsheet_id", "")).strip()
-        if spreadsheet_id and service_account:
-            return GoogleSheetsStore(spreadsheet_id, service_account)
-    except Exception:
-        raise
+
+    settings = dict(secrets.get("google_sheets", {}))
+    spreadsheet_id = str(
+        settings.get("spreadsheet_id", "")
+        or secrets.get("GOOGLE_SPREADSHEET_ID", "")
+        or secrets.get("GOOGLE_SHEET_ID", "")
+    ).strip()
+
+    service_account = dict(secrets.get("gcp_service_account", {}))
+    legacy_json = secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not service_account and legacy_json:
+        if isinstance(legacy_json, str):
+            try:
+                parsed = json.loads(legacy_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "GOOGLE_SERVICE_ACCOUNT_JSON 不是有效的 JSON；請完整複製舊 Agent 的三引號內容。"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON 必須是一個 JSON 物件。")
+            service_account = parsed
+        else:
+            service_account = dict(legacy_json)
+
+    if spreadsheet_id and service_account:
+        return GoogleSheetsStore(spreadsheet_id, service_account)
     return InMemoryStore()
 
 
