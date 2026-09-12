@@ -90,37 +90,82 @@ class GeminiKeyPool:
         max_output_tokens: int,
     ) -> str:
         from google import genai
+        from google.genai import types
 
         client = genai.Client(api_key=api_key)
-        try:
-            from google.genai import types
 
-            response = client.models.generate_content(
+        def _finish_reason(response) -> str:
+            try:
+                candidates = getattr(response, "candidates", None) or []
+                if not candidates:
+                    return ""
+                reason = getattr(candidates[0], "finish_reason", "")
+                return str(reason or "").upper()
+            except Exception:
+                return ""
+
+        def _generate_with_limit(token_limit: int):
+            config_kwargs = {
+                "system_instruction": system_prompt,
+                "temperature": temperature,
+                "max_output_tokens": token_limit,
+            }
+
+            # Gemini 3.x 預設會使用 thinking；團體角色回應不需要高推理量。
+            # 使用 low 可降低 thought tokens 佔滿輸出上限、導致句子被截斷的風險。
+            if model_name.startswith("gemini-3"):
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level="low"
+                )
+
+            return client.models.generate_content(
                 model=model_name,
                 contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
-                ),
+                config=types.GenerateContentConfig(**config_kwargs),
             )
-            text = getattr(response, "text", "")
+
+        try:
+            # 對話原本只給 600 tokens；Gemini thinking tokens 也計入上限，
+            # 因此至少保留 1200，若仍碰到 MAX_TOKENS 再自動加大一次。
+            first_limit = max(int(max_output_tokens), 1200)
+            second_limit = max(first_limit * 2, 2000)
+
+            response = _generate_with_limit(first_limit)
+            text = str(getattr(response, "text", "") or "").strip()
+            finish_reason = _finish_reason(response)
+
+            if "MAX_TOKENS" in finish_reason:
+                response = _generate_with_limit(second_limit)
+                text = str(getattr(response, "text", "") or "").strip()
+                finish_reason = _finish_reason(response)
+
+            if "MAX_TOKENS" in finish_reason:
+                raise RuntimeError(
+                    "模型輸出仍因 MAX_TOKENS 被截斷，系統未採用不完整句子。"
+                )
+
+            return text
+
         except AttributeError:
+            # 舊 SDK 相容路徑
+            generation_config = {
+                "temperature": temperature,
+                "max_output_tokens": max(int(max_output_tokens), 1200),
+            }
+            if model_name.startswith("gemini-3"):
+                generation_config["thinking_level"] = "low"
+
             interaction = client.interactions.create(
                 model=model_name,
                 input=user_prompt,
                 system_instruction=system_prompt,
-                generation_config={
-                    "temperature": temperature,
-                    "max_output_tokens": max_output_tokens,
-                },
+                generation_config=generation_config,
             )
-            text = getattr(interaction, "output_text", "")
+            return str(getattr(interaction, "output_text", "") or "").strip()
         finally:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
-        return str(text or "").strip()
 
     def generate(
         self,
