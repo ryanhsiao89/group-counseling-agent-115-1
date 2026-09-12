@@ -341,6 +341,24 @@ def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], targ
         target_peer_name=target_peer,
     )
 
+    system_prompt += """
+
+【括號內文字＝非語言訊息】
+學生輸入中，半形括號 (...) 或全形括號（...）內的文字，一律視為「非語言行為／姿態／沉默／視線／表情／動作」，不是學生實際說出口的話。
+例如：
+- （安靜等待他人發言）
+- （點頭）
+- （看向心妤）
+- （沉默幾秒）
+- （微笑但沒有接話）
+
+回應規則：
+1. 不要把括號內文字當成口語內容引用，不可說「你剛才說『安靜等待他人發言』」。
+2. 可以依該非語言線索調整團體歷程，例如尊重沉默、注意視線、把發言機會交給其他成員、回應情緒氣氛。
+3. 若括號訊息表示學生暫時不想說話、等待、沉默或把空間留給別人，不要立刻追問學生；優先讓其他成員參與或由 Leader 容納短暫沉默。
+4. 若一句輸入同時有口語與括號動作，口語是實際發言，括號是補充的非語言脈絡。
+""".strip()
+
     if is_member_mode_leader:
         stage_task = {
             "opening": (
@@ -853,6 +871,10 @@ def render_practice() -> None:
         f"{context.school_name}"
     )
     st.info("請勿輸入真實個案的姓名、電話、地址、學號或可辨識的學校／公司資訊。")
+    st.caption(
+        "互動提示：若要表達非語言行為，可使用括號，例如 "
+        "（安靜等待他人發言）、（點頭）、（看向心妤）。"
+    )
 
     display_people = context.participants if context.role_mode == "leader" else [AI_LEADER, *context.participants]
     columns = st.columns(len(display_people))
@@ -929,7 +951,16 @@ def render_practice() -> None:
     cooldown_left = max(0, CONFIG.input_cooldown_seconds - int(time.time() - st.session_state.last_submit_at))
     if cooldown_left > 0:
         st.caption(f"請稍候約 {cooldown_left} 秒再送出下一段。")
-    user_input = st.chat_input(f"輸入你的回應（最多 {CONFIG.max_user_input_chars} 字）")
+
+    st.caption(
+        "💡 可用括號輸入非語言訊息，例如："
+        "（安靜等待他人發言）、（點頭）、（看向某位成員）、（沉默幾秒）。"
+        "括號內內容會被 AI 視為動作／姿態，而不是你說出口的話。"
+    )
+
+    user_input = st.chat_input(
+        f"輸入你的回應（最多 {CONFIG.max_user_input_chars} 字）；非語言訊息可寫在（括號）內"
+    )
     if user_input:
         text = user_input.strip()
         if not text:
