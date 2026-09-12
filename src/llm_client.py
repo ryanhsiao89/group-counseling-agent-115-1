@@ -26,6 +26,28 @@ def is_invalid_key_error(error: Exception) -> bool:
     return any(x in text for x in ("api_key_invalid", "api key not valid", "invalid api key", "permission_denied"))
 
 
+def is_transient_service_error(error: Exception) -> bool:
+    """辨識適合稍後重試的 Gemini 暫時性服務錯誤。"""
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "408",
+            "500",
+            "502",
+            "503",
+            "504",
+            "unavailable",
+            "high demand",
+            "service unavailable",
+            "temporarily unavailable",
+            "timeout",
+            "timed out",
+            "connection reset",
+        )
+    )
+
+
 @dataclass
 class GenerationResult:
     text: str
@@ -113,7 +135,12 @@ class GeminiKeyPool:
                 return GenerationResult(text=text, key_index=self.current_index, latency_ms=latency)
             except Exception as error:
                 last_error = error
-                if (is_invalid_key_error(error) or is_quota_error(error)) and self.current_index + 1 < len(self.api_keys):
+                recoverable = (
+                    is_invalid_key_error(error)
+                    or is_quota_error(error)
+                    or is_transient_service_error(error)
+                )
+                if recoverable and self.current_index + 1 < len(self.api_keys):
                     self.current_index += 1
                     continue
                 if is_invalid_key_error(error):
@@ -121,6 +148,13 @@ class GeminiKeyPool:
                 if is_quota_error(error):
                     self.blocked_until = time.time() + self.cooldown_seconds
                     raise RuntimeError("所有 API Key 暫時達到額度或流量限制，請稍後再試。") from error
+                if is_transient_service_error(error):
+                    temporary_cooldown = min(self.cooldown_seconds, 30)
+                    self.blocked_until = time.time() + temporary_cooldown
+                    raise RuntimeError(
+                        "Gemini 模型目前使用量較高，服務暫時忙碌；"
+                        f"這不是 API Key 錯誤，請約 {temporary_cooldown} 秒後再試。"
+                    ) from error
                 raise RuntimeError(f"Gemini 生成失敗：{error}") from error
         self.blocked_until = time.time() + self.cooldown_seconds
         raise RuntimeError(f"Gemini 生成失敗：{last_error}")
