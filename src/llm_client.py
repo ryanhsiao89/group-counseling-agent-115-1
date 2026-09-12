@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 
 
-ENGINE_VERSION = "resilience-v1.5"
+ENGINE_VERSION = "resilience-v1.6"
 
 
 def parse_api_keys(raw: str) -> list[str]:
