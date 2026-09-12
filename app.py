@@ -87,6 +87,7 @@ DEFAULT_STATE = {
     "stage_summary": {},
     "stage_summary_raw": "",
     "intro_generated": False,
+    "intro_error": "",
     "last_series_state": None,
 }
 
@@ -112,6 +113,7 @@ def reset_practice() -> None:
     for key in (
         "practice_context", "turns", "turn_index", "api_pool", "last_submit_at", "finished",
         "assessment", "assessment_raw", "stage_summary", "stage_summary_raw", "intro_generated",
+        "intro_error",
         "last_series_state",
     ):
         default = DEFAULT_STATE[key]
@@ -667,13 +669,28 @@ def render_practice() -> None:
             st.markdown(f"**{turn['speaker_name']}：** {turn['content']}")
 
     if context.role_mode == "member" and not st.session_state.intro_generated:
-        st.session_state.intro_generated = True
-        try:
-            with st.spinner("團體帶領者正在開場…"):
-                generate_actor_reply(context, AI_LEADER)
-            st.rerun()
-        except Exception as error:
-            st.warning(f"AI 團體帶領者暫時無法開場：{error}")
+        intro_status = st.empty()
+        retry_intro = not st.session_state.intro_error
+        if st.session_state.intro_error:
+            intro_status.warning(
+                f"AI 團體帶領者暫時無法開場：{st.session_state.intro_error}"
+            )
+            retry_intro = st.button(
+                "重新嘗試 AI 開場",
+                type="primary",
+                key="retry_ai_leader_intro",
+            )
+
+        if retry_intro:
+            try:
+                with st.spinner("團體帶領者正在開場…"):
+                    generate_actor_reply(context, AI_LEADER)
+                st.session_state.intro_generated = True
+                st.session_state.intro_error = ""
+                st.rerun()
+            except Exception as error:
+                st.session_state.intro_error = str(error)
+                intro_status.warning(f"AI 團體帶領者暫時無法開場：{error}")
 
     cooldown_left = max(0, CONFIG.input_cooldown_seconds - int(time.time() - st.session_state.last_submit_at))
     if cooldown_left > 0:
