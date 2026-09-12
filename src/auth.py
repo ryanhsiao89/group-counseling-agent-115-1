@@ -1,160 +1,86 @@
-"""Google GenAI SDK 包裝、金鑰輪替與錯誤分類。"""
+"""Email 驗證、OTP 與匿名 participant_id。"""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
+import smtplib
 import time
 from dataclasses import dataclass
+from email.mime.text import MIMEText
+from typing import Any, Mapping
 
 
-def parse_api_keys(raw: str) -> list[str]:
-    normalized = raw.replace("，", ",").replace("\n", ",")
-    keys = []
-    for item in normalized.split(","):
-        key = item.strip()
-        if key and key not in keys:
-            keys.append(key)
-    return keys
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
 
 
-def is_quota_error(error: Exception) -> bool:
-    text = str(error).lower()
-    return any(x in text for x in ("429", "quota", "resource_exhausted", "resource exhausted", "rate limit"))
+def is_allowed_email(email: str, allowed_domain: str, teacher_test_emails: tuple[str, ...]) -> bool:
+    normalized = normalize_email(email)
+    if not normalized or "@" not in normalized:
+        return False
+    domain = allowed_domain.lower().lstrip("@")
+    return normalized.endswith(f"@{domain}") or normalized in set(teacher_test_emails)
 
 
-def is_invalid_key_error(error: Exception) -> bool:
-    text = str(error).lower()
-    return any(x in text for x in ("api_key_invalid", "api key not valid", "invalid api key", "permission_denied"))
+def make_participant_id(email: str, salt: str) -> str:
+    digest = hmac.new(
+        salt.encode("utf-8"),
+        normalize_email(email).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"P_{digest[:16]}"
 
 
-def is_transient_service_error(error: Exception) -> bool:
-    """辨識適合稍後重試的 Gemini 暫時性服務錯誤。"""
-    text = str(error).lower()
-    return any(
-        marker in text
-        for marker in (
-            "408",
-            "500",
-            "502",
-            "503",
-            "504",
-            "unavailable",
-            "high demand",
-            "service unavailable",
-            "temporarily unavailable",
-            "timeout",
-            "timed out",
-            "connection reset",
-        )
-    )
+def generate_otp() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def hash_otp(otp: str, nonce: str) -> str:
+    return hmac.new(nonce.encode("utf-8"), otp.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_otp(candidate: str, expected_hash: str, nonce: str) -> bool:
+    return hmac.compare_digest(hash_otp(candidate.strip(), nonce), expected_hash)
 
 
 @dataclass
-class GenerationResult:
-    text: str
-    key_index: int
-    latency_ms: int
+class OtpChallenge:
+    email: str
+    otp_hash: str
+    nonce: str
+    issued_at: float
+    attempts: int = 0
+
+    def expired(self, expiry_seconds: int, now: float | None = None) -> bool:
+        return (now or time.time()) - self.issued_at > expiry_seconds
 
 
-class GeminiKeyPool:
-    def __init__(self, api_keys: list[str], model_name: str, cooldown_seconds: int = 90):
-        if not api_keys:
-            raise ValueError("至少需要一把 Gemini API Key。")
-        self.api_keys = api_keys
-        self.model_name = model_name
-        self.cooldown_seconds = cooldown_seconds
-        self.current_index = 0
-        self.blocked_until = 0.0
+def mask_email(email: str) -> str:
+    local, _, domain = normalize_email(email).partition("@")
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}***@{domain}"
 
-    def _generate_once(
-        self,
-        api_key: str,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float,
-        max_output_tokens: int,
-    ) -> str:
-        from google import genai
 
-        client = genai.Client(api_key=api_key)
-        try:
-            from google.genai import types
+def send_otp_email(receiver_email: str, otp: str, email_settings: Mapping[str, Any]) -> None:
+    sender_email = str(email_settings.get("sender_email", "")).strip()
+    app_password = str(email_settings.get("app_password", "")).replace(" ", "").strip()
+    if not sender_email or not app_password:
+        raise RuntimeError("尚未設定寄件 Gmail 與 App Password。")
 
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
-                ),
-            )
-            text = getattr(response, "text", "")
-        except AttributeError:
-            interaction = client.interactions.create(
-                model=self.model_name,
-                input=user_prompt,
-                system_instruction=system_prompt,
-                generation_config={
-                    "temperature": temperature,
-                    "max_output_tokens": max_output_tokens,
-                },
-            )
-            text = getattr(interaction, "output_text", "")
-        finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
-        return str(text or "").strip()
+    body = (
+        "您好：\n\n"
+        "歡迎使用 115-1 團體諮商 AI 模擬演練系統。\n\n"
+        f"您的 6 位數登入驗證碼是：{otp}\n\n"
+        "驗證碼約 10 分鐘內有效。若非您本人操作，請忽略此信。\n"
+        "本系統僅供教學演練，不提供心理治療或緊急危機服務。"
+    )
+    message = MIMEText(body, "plain", "utf-8")
+    message["Subject"] = "團體諮商 AI Agent 登入驗證碼"
+    message["From"] = sender_email
+    message["To"] = receiver_email
 
-    def generate(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        *,
-        temperature: float = 0.4,
-        max_output_tokens: int = 700,
-    ) -> GenerationResult:
-        if time.time() < self.blocked_until:
-            wait = int(self.blocked_until - time.time()) + 1
-            raise RuntimeError(f"Gemini 暫時達到流量限制，請約 {wait} 秒後再試。")
-
-        last_error: Exception | None = None
-        while self.current_index < len(self.api_keys):
-            started = time.perf_counter()
-            try:
-                text = self._generate_once(
-                    self.api_keys[self.current_index],
-                    system_prompt,
-                    user_prompt,
-                    temperature,
-                    max_output_tokens,
-                )
-                if not text:
-                    raise RuntimeError("模型回覆為空。")
-                latency = int((time.perf_counter() - started) * 1000)
-                return GenerationResult(text=text, key_index=self.current_index, latency_ms=latency)
-            except Exception as error:
-                last_error = error
-                recoverable = (
-                    is_invalid_key_error(error)
-                    or is_quota_error(error)
-                    or is_transient_service_error(error)
-                )
-                if recoverable and self.current_index + 1 < len(self.api_keys):
-                    self.current_index += 1
-                    continue
-                if is_invalid_key_error(error):
-                    raise RuntimeError("Gemini API Key 無效，請回到設定頁重新確認。") from error
-                if is_quota_error(error):
-                    self.blocked_until = time.time() + self.cooldown_seconds
-                    raise RuntimeError("所有 API Key 暫時達到額度或流量限制，請稍後再試。") from error
-                if is_transient_service_error(error):
-                    temporary_cooldown = min(self.cooldown_seconds, 30)
-                    self.blocked_until = time.time() + temporary_cooldown
-                    raise RuntimeError(
-                        "Gemini 模型目前使用量較高，服務暫時忙碌；"
-                        f"這不是 API Key 錯誤，請約 {temporary_cooldown} 秒後再試。"
-                    ) from error
-                raise RuntimeError(f"Gemini 生成失敗：{error}") from error
-        self.blocked_until = time.time() + self.cooldown_seconds
-        raise RuntimeError(f"Gemini 生成失敗：{last_error}")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
+        server.login(sender_email, app_password)
+        server.send_message(message)
