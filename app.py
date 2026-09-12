@@ -22,7 +22,7 @@ from src.auth import (
 )
 from src.config import load_config
 from src.data_manager import InMemoryStore, create_store, make_series_state
-from src.llm_client import GeminiKeyPool, parse_api_keys
+from src.llm_client import ENGINE_VERSION, GeminiKeyPool, parse_api_keys
 from src.models import PracticeContext, STAGE_LABELS, STAGES, next_stage
 from src.prompts import (
     APPROACHES,
@@ -88,6 +88,8 @@ DEFAULT_STATE = {
     "stage_summary_raw": "",
     "intro_generated": False,
     "intro_error": "",
+    "pending_ai_reply": None,
+    "active_model_name": "",
     "last_series_state": None,
 }
 
@@ -113,8 +115,7 @@ def reset_practice() -> None:
     for key in (
         "practice_context", "turns", "turn_index", "api_pool", "last_submit_at", "finished",
         "assessment", "assessment_raw", "stage_summary", "stage_summary_raw", "intro_generated",
-        "intro_error",
-        "last_series_state",
+        "intro_error", "pending_ai_reply", "active_model_name", "last_series_state",
     ):
         default = DEFAULT_STATE[key]
         st.session_state[key] = default.copy() if isinstance(default, (list, dict)) else default
@@ -159,7 +160,17 @@ def append_and_log(context: PracticeContext, turn: dict[str, Any]) -> None:
 def start_practice(context: PracticeContext, keys: list[str]) -> None:
     reset_practice()
     save_context(context)
-    st.session_state.api_pool = GeminiKeyPool(keys, CONFIG.model_name, CONFIG.api_cooldown_seconds)
+    st.session_state.api_pool = GeminiKeyPool(
+        keys,
+        CONFIG.model_name,
+        CONFIG.api_cooldown_seconds,
+        getattr(
+            CONFIG,
+            "fallback_model_names",
+            ("gemini-3.5-flash", "gemini-3.1-flash-lite"),
+        ),
+    )
+    st.session_state.active_model_name = CONFIG.model_name
     try:
         STORE.append_session_event(session_start_record(context, CONFIG.model_name, CONFIG.prompt_version))
     except Exception as error:
@@ -199,6 +210,7 @@ def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], targ
         target_peer_name=target_peer,
     )
     result = pool.generate(system_prompt, user_prompt, temperature=0.4, max_output_tokens=600)
+    st.session_state.active_model_name = result.model_name
     speaker_role = "ai_leader" if speaker["id"] == "ai_leader" else "ai_group_member"
     turn = add_turn(
         context=context,
@@ -208,6 +220,7 @@ def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], targ
         speaker_role=speaker_role,
         content=result.text,
         latency_ms=result.latency_ms,
+        source=f"live:{result.model_name}",
     )
     append_and_log(context, turn)
 
@@ -227,9 +240,12 @@ def safe_finish_practice(context: PracticeContext) -> None:
 
     summary_raw = ""
     summary: dict[str, Any] = {}
+    summary_model_name = CONFIG.model_name
     try:
         system_prompt, user_prompt = build_stage_summary_prompt(context_for_model, transcript)
         result = pool.generate(system_prompt, user_prompt, temperature=0.0, max_output_tokens=1500)
+        summary_model_name = result.model_name
+        st.session_state.active_model_name = result.model_name
         summary_raw = result.text
         summary = extract_json_object(summary_raw)
     except Exception as error:
@@ -250,9 +266,12 @@ def safe_finish_practice(context: PracticeContext) -> None:
 
     assessment_raw = ""
     assessment: dict[str, Any] = {}
+    assessment_model_name = CONFIG.model_name
     try:
         system_prompt, user_prompt = build_assessment_prompt(context_for_model, transcript)
         result = pool.generate(system_prompt, user_prompt, temperature=0.0, max_output_tokens=1800)
+        assessment_model_name = result.model_name
+        st.session_state.active_model_name = result.model_name
         assessment_raw = result.text
         assessment = extract_json_object(assessment_raw)
     except Exception as error:
@@ -285,7 +304,7 @@ def safe_finish_practice(context: PracticeContext) -> None:
             "carryover_summary": summary.get("carryover_summary", ""),
             "raw_model_output": summary_raw,
             "parsed_json": summary,
-            "model_name": CONFIG.model_name,
+            "model_name": summary_model_name,
             "prompt_version": CONFIG.prompt_version,
             "created_at": created_at,
         })
@@ -310,11 +329,15 @@ def safe_finish_practice(context: PracticeContext) -> None:
             "next_practice_task": assessment.get("next_practice_task", ""),
             "raw_model_output": assessment_raw,
             "parsed_json": assessment,
-            "model_name": CONFIG.model_name,
+            "model_name": assessment_model_name,
             "created_at": created_at,
         })
         STORE.append_session_event({
-            **session_start_record(context, CONFIG.model_name, CONFIG.prompt_version),
+            **session_start_record(
+                context,
+                st.session_state.active_model_name or CONFIG.model_name,
+                CONFIG.prompt_version,
+            ),
             "event_type": "end",
             "ended_at": created_at,
             "duration_seconds": seconds_since(context.started_at_epoch),
@@ -608,6 +631,11 @@ def render_practice() -> None:
         st.write(f"**角色：** {'Leader' if context.role_mode == 'leader' else 'Member'}")
         st.write(f"**階段：** {STAGE_LABELS[context.stage]}")
         st.write(f"**學派：** {context.school_name}")
+        active_model = st.session_state.active_model_name or CONFIG.model_name
+        st.caption(f"目前模型：{active_model}")
+        st.caption(f"AI 引擎版本：{ENGINE_VERSION}")
+        if active_model != CONFIG.model_name:
+            st.info("主要模型忙碌，系統已自動切換備援模型，練習可繼續。")
         elapsed = seconds_since(context.started_at_epoch)
         st.metric("已進行", f"{elapsed // 60:02d}:{elapsed % 60:02d}")
         if context.duration_target_minutes:
@@ -692,6 +720,35 @@ def render_practice() -> None:
                 st.session_state.intro_error = str(error)
                 intro_status.warning(f"AI 團體帶領者暫時無法開場：{error}")
 
+    pending_reply = st.session_state.pending_ai_reply
+    if pending_reply:
+        pending_speaker = dict(pending_reply.get("speaker", {}))
+        pending_name = pending_speaker.get("name", "AI 成員")
+        st.warning(
+            f"{pending_name} 上一次暫時無法回應："
+            f"{pending_reply.get('error', 'Gemini 服務暫時忙碌')}"
+        )
+        if st.button(
+            f"重新嘗試 {pending_name} 回應",
+            type="primary",
+            key="retry_pending_ai_reply",
+        ):
+            try:
+                with st.spinner(f"{pending_name} 正在重新回應…"):
+                    generate_actor_reply(
+                        context,
+                        pending_speaker,
+                        str(pending_reply.get("target_peer", "")),
+                    )
+                st.session_state.pending_ai_reply = None
+                st.rerun()
+            except Exception as error:
+                pending_reply["error"] = str(error)
+                st.session_state.pending_ai_reply = pending_reply
+                st.warning(f"仍無法取得回應：{error}")
+        st.caption("請先完成這次重試，再繼續輸入，以維持團體對話順序。")
+        return
+
     cooldown_left = max(0, CONFIG.input_cooldown_seconds - int(time.time() - st.session_state.last_submit_at))
     if cooldown_left > 0:
         st.caption(f"請稍候約 {cooldown_left} 秒再送出下一段。")
@@ -738,9 +795,10 @@ def render_practice() -> None:
 
         speakers = choose_speakers(context, text, st.session_state.turns)
         for speaker in speakers:
+            target_peer = peer_target(speaker, context)
             try:
                 with st.spinner(f"{speaker['name']} 正在回應…"):
-                    generate_actor_reply(context, speaker, peer_target(speaker, context))
+                    generate_actor_reply(context, speaker, target_peer)
             except Exception as error:
                 error_turn = add_turn(
                     context=context,
@@ -754,6 +812,11 @@ def render_practice() -> None:
                     error_flag=str(error),
                 )
                 append_and_log(context, error_turn)
+                st.session_state.pending_ai_reply = {
+                    "speaker": dict(speaker),
+                    "target_peer": target_peer,
+                    "error": str(error),
+                }
                 break
         st.rerun()
 
