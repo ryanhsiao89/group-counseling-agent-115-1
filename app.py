@@ -207,9 +207,10 @@ def _member_mode_speakers(
     if last_ai_id == "ai_leader" and candidate is not None:
         return [candidate, AI_LEADER]
 
-    # 開始期避免一次湧入太多 AI 訊息；Leader 先接住並邀請下一步。
+    # 開始期也要讓 AI 成員實際參與，不讓 Student Member 變成唯一焦點。
+    # 先由最久未發言的 AI 成員回應，再由 Leader 串聯與分配下一輪焦點。
     if context.stage == "opening":
-        return [AI_LEADER]
+        return [candidate, AI_LEADER] if candidate is not None else [AI_LEADER]
 
     # 形成／工作／結束期：Leader 先做歷程介入，再邀請一名成員回應，
     # 讓學生能實際體驗成員間互動，而不是多個平行的個別對話。
@@ -254,14 +255,76 @@ def start_practice(context: PracticeContext, keys: list[str]) -> None:
     append_and_log(context, system_turn)
 
 
+
+def _student_wants_less_focus(user_text: str) -> bool:
+    """學生明確表示暫不發言／希望轉給別人時，Leader 不再追問學生。"""
+    text = user_text.strip().lower()
+    markers = (
+        "先不說", "不想說", "不說了", "我不說", "不要問我", "不要再問我",
+        "別問我", "換別人", "請別人", "讓別人", "給別人", "別人說",
+        "不要一直問", "不要一直點", "怎麼又換我", "怎麼又是我",
+        "怎麼又把焦點放我", "先聽", "我先聽", "旁邊聽",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _least_recent_ai_member(context: PracticeContext, turns: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """找最久沒有發言的 AI 成員，讓邀請焦點不要集中在固定同一人。"""
+    if not context.participants:
+        return None
+
+    def recency_score(participant: dict[str, Any]) -> int:
+        pid = str(participant.get("id", ""))
+        for distance, turn in enumerate(reversed(turns)):
+            if str(turn.get("speaker_id", "")) == pid:
+                return distance
+        return 10**6
+
+    return max(context.participants, key=recency_score)
+
+
+def _member_mode_leader_target(
+    context: PracticeContext,
+    turns: list[dict[str, Any]],
+    user_text: str,
+    next_speaker: dict[str, Any] | None = None,
+) -> str:
+    """決定 AI Leader 下一個邀請對象。
+
+    原則：
+    1. Student Member 是團體中的一員，不是預設焦點。
+    2. 若本輪後面已排 AI 成員，Leader 直接把話交給該成員。
+    3. 學生明確表示暫不發言時，至少本輪完全不再追問學生。
+    4. 其餘情況採約 2:1 的 AI 成員：學生邀請比例，並優先最久未發言的 AI 成員。
+    """
+    if next_speaker is not None:
+        return str(next_speaker.get("name", "")).strip()
+
+    ai_member = _least_recent_ai_member(context, turns)
+    ai_member_name = str(ai_member.get("name", "")).strip() if ai_member else ""
+
+    if _student_wants_less_focus(user_text):
+        return ai_member_name or "其他團體成員"
+
+    leader_turn_count = sum(
+        1
+        for turn in turns
+        if str(turn.get("speaker_id", "")) == "ai_leader"
+        and str(turn.get("speaker_role", "")).startswith("ai_")
+    )
+
+    # 每三次 Leader 邀請中，大約一次回到 Student Member；
+    # 另外兩次優先邀請 AI 成員，避免學生一直成為焦點。
+    if leader_turn_count % 3 == 2:
+        return "你（學生團體成員）"
+
+    return ai_member_name or "你（學生團體成員）"
+
+
 def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], target_peer: str = "") -> None:
     pool: GeminiKeyPool = st.session_state.api_pool
 
     is_member_mode_leader = context.role_mode == "member" and speaker.get("id") == "ai_leader"
-    if is_member_mode_leader and not target_peer:
-        # Leader 單獨出現時，優先把話交回學生；若後面排了 AI 成員，
-        # 呼叫端會把該成員姓名指定為 target_peer。
-        target_peer = "你（學生團體成員）"
 
     system_prompt, user_prompt = build_dialogue_prompts(
         role_mode=context.role_mode,
@@ -307,6 +370,16 @@ def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], targ
 澄清焦點、邀請較少發言者、連結兩位成員的共同／不同經驗、促進成員互相回應、
 整理目前團體正在發生的事，或依階段推進下一步。
 不要只是回答學生的問題，也不要等學生提醒「Leader 你要不要說些什麼」。
+
+【邀請焦點分配】
+- Student Member 只是團體成員之一，不是預設焦點，也不是每一輪都必須被追問的人。
+- 要主動把發言機會平均分散到 Student Member 與各 AI 成員；不要連續兩次以上把問題丟給 Student Member。
+- 若 Student Member 剛發言，通常先把話交給另一位 AI 成員，除非他的內容明確需要立即澄清。
+- 若某位 AI 成員較少發言，要主動邀請他，而不是一直問同一個人。
+- 可以使用「剛才心妤提到……承翰聽到這裡怎麼想？」或「這裡好像有兩種不同感受，芷寧你有沒有注意到什麼？」之類的橫向串聯。
+- 若 Student Member 明確說「先不說」、「換別人」、「不要再問我」或同等意思，立刻尊重；不要再追問他是否舒服、是否放鬆、是否願意說，也不要用另一個問題把焦點繞回他。至少先讓一到兩位其他成員發言後，再視團體脈絡決定是否自然開放邀請。
+- 當成員拒絕發言時，可簡短確認「可以，你先聽就好」，然後立刻把焦點轉向其他成員或整個團體。
+
 每次以一個清楚焦點為主，避免連珠炮式盤問；通常以一個自然、開放、可回應的邀請收尾。
 若指定邀請對象為「{target_peer}」，請讓最後一句自然地把話交給該對象。
 若剛才是一位 AI 成員回應學生，請先簡短反映／串聯，再把討論擴回整個團體，而不是重複該成員原話。
@@ -904,10 +977,13 @@ def render_practice() -> None:
 
         for speaker_index, speaker in enumerate(speakers):
             if context.role_mode == "member" and speaker.get("id") == "ai_leader":
-                if speaker_index + 1 < len(speakers):
-                    target_peer = str(speakers[speaker_index + 1].get("name", "")).strip()
-                else:
-                    target_peer = "你（學生團體成員）"
+                next_speaker = speakers[speaker_index + 1] if speaker_index + 1 < len(speakers) else None
+                target_peer = _member_mode_leader_target(
+                    context,
+                    st.session_state.turns,
+                    text,
+                    next_speaker=next_speaker,
+                )
             else:
                 target_peer = peer_target(speaker, context)
             try:
