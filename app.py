@@ -209,7 +209,7 @@ def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], targ
         recent_turns=st.session_state.turns[-CONFIG.max_recent_messages :],
         target_peer_name=target_peer,
     )
-    result = pool.generate(system_prompt, user_prompt, temperature=0.4, max_output_tokens=600)
+    result = pool.generate(system_prompt, user_prompt, temperature=0.4, max_output_tokens=1200)
     st.session_state.active_model_name = result.model_name
     speaker_role = "ai_leader" if speaker["id"] == "ai_leader" else "ai_group_member"
     turn = add_turn(
