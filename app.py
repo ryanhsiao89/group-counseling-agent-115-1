@@ -157,6 +157,67 @@ def append_and_log(context: PracticeContext, turn: dict[str, Any]) -> None:
     log_turn(context, turn)
 
 
+def _member_mode_speakers(
+    context: PracticeContext,
+    user_text: str,
+    turns: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Member 體驗模式的發言編排：AI Leader 必須持續承擔帶領責任。"""
+    lowered = user_text.strip().lower()
+
+    # 學生明確叫 Leader／帶領者時，由 AI Leader 立即接手。
+    leader_tokens = ("leader", "ai leader", "帶領者", "團體帶領者", "主持人")
+    if any(token in lowered for token in leader_tokens):
+        return [AI_LEADER]
+
+    # 學生直接點名某位 AI 成員時：該成員先回應，Leader 隨後統整／串聯。
+    named_member = None
+    for participant in context.participants:
+        name = str(participant.get("name", "")).strip()
+        participant_id = str(participant.get("id", "")).strip()
+        if (name and name.lower() in lowered) or (participant_id and participant_id.lower() in lowered):
+            named_member = participant
+            break
+    if named_member is not None:
+        return [named_member, AI_LEADER]
+
+    # 找上一位 AI 發言者。
+    last_ai_id = ""
+    for turn in reversed(turns):
+        if str(turn.get("speaker_role", "")).startswith("ai_"):
+            last_ai_id = str(turn.get("speaker_id", ""))
+            break
+
+    # 優先讓「最久沒說話」的 AI 成員取得發言機會，避免固定同一人。
+    def recency_score(participant: dict[str, Any]) -> int:
+        pid = str(participant.get("id", ""))
+        for distance, turn in enumerate(reversed(turns)):
+            if str(turn.get("speaker_id", "")) == pid:
+                return distance
+        return 10**6
+
+    ordered_members = sorted(
+        list(context.participants),
+        key=recency_score,
+        reverse=True,
+    )
+    candidate = ordered_members[0] if ordered_members else None
+
+    # 若上一位 AI 是 Leader，先讓一位成員說，再由 Leader 收束並繼續帶領。
+    if last_ai_id == "ai_leader" and candidate is not None:
+        return [candidate, AI_LEADER]
+
+    # 開始期避免一次湧入太多 AI 訊息；Leader 先接住並邀請下一步。
+    if context.stage == "opening":
+        return [AI_LEADER]
+
+    # 形成／工作／結束期：Leader 先做歷程介入，再邀請一名成員回應，
+    # 讓學生能實際體驗成員間互動，而不是多個平行的個別對話。
+    if candidate is not None:
+        return [AI_LEADER, candidate]
+    return [AI_LEADER]
+
+
 def start_practice(context: PracticeContext, keys: list[str]) -> None:
     reset_practice()
     save_context(context)
@@ -195,6 +256,13 @@ def start_practice(context: PracticeContext, keys: list[str]) -> None:
 
 def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], target_peer: str = "") -> None:
     pool: GeminiKeyPool = st.session_state.api_pool
+
+    is_member_mode_leader = context.role_mode == "member" and speaker.get("id") == "ai_leader"
+    if is_member_mode_leader and not target_peer:
+        # Leader 單獨出現時，優先把話交回學生；若後面排了 AI 成員，
+        # 呼叫端會把該成員姓名指定為 target_peer。
+        target_peer = "你（學生團體成員）"
+
     system_prompt, user_prompt = build_dialogue_prompts(
         role_mode=context.role_mode,
         speaker=speaker,
@@ -209,6 +277,42 @@ def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], targ
         recent_turns=st.session_state.turns[-CONFIG.max_recent_messages :],
         target_peer_name=target_peer,
     )
+
+    if is_member_mode_leader:
+        stage_task = {
+            "opening": (
+                "開始期：主動建立安全感與方向，簡短說明此刻團體要做什麼，"
+                "邀請成員自我介紹、表達期待或說出目前最想談的一件事；"
+                "注意讓學生與其他成員都有進入團體的機會。"
+            ),
+            "formation": (
+                "形成期：主動注意沉默、觀望、競爭、防衛與參與差異；"
+                "適度正常化猶豫，邀請較少發言者，也可詢問不同意見。"
+            ),
+            "working": (
+                "工作期：主動深化核心情緒與此時此刻經驗，辨識共同性、差異、支持或張力，"
+                "並促進成員直接回應彼此，而不是所有話都只對 Leader 說。"
+            ),
+            "ending": (
+                "結束期：主動整合本次收穫，邀請彼此回饋、離別或未竟感受，"
+                "並連結到團體外可帶走的行動或意義。"
+            ),
+        }.get(context.stage, "依目前團體階段主動維持團體歷程。")
+
+        system_prompt += f"""
+
+【Member 模式：AI 團體帶領者的主動帶領責任】
+你不是等待被點名才說話的成員，而是本團體的帶領者。
+每次輪到你，都要先接住上一位發言者的核心內容或情緒，再主動完成至少一項團體歷程工作：
+澄清焦點、邀請較少發言者、連結兩位成員的共同／不同經驗、促進成員互相回應、
+整理目前團體正在發生的事，或依階段推進下一步。
+不要只是回答學生的問題，也不要等學生提醒「Leader 你要不要說些什麼」。
+每次以一個清楚焦點為主，避免連珠炮式盤問；通常以一個自然、開放、可回應的邀請收尾。
+若指定邀請對象為「{target_peer}」，請讓最後一句自然地把話交給該對象。
+若剛才是一位 AI 成員回應學生，請先簡短反映／串聯，再把討論擴回整個團體，而不是重複該成員原話。
+本階段特別任務：{stage_task}
+""".strip()
+
     result = pool.generate(system_prompt, user_prompt, temperature=0.4, max_output_tokens=1200)
     st.session_state.active_model_name = result.model_name
     speaker_role = "ai_leader" if speaker["id"] == "ai_leader" else "ai_group_member"
@@ -793,9 +897,19 @@ def render_practice() -> None:
             append_and_log(context, safety_turn)
             st.rerun()
 
-        speakers = choose_speakers(context, text, st.session_state.turns)
-        for speaker in speakers:
-            target_peer = peer_target(speaker, context)
+        if context.role_mode == "member":
+            speakers = _member_mode_speakers(context, text, st.session_state.turns)
+        else:
+            speakers = choose_speakers(context, text, st.session_state.turns)
+
+        for speaker_index, speaker in enumerate(speakers):
+            if context.role_mode == "member" and speaker.get("id") == "ai_leader":
+                if speaker_index + 1 < len(speakers):
+                    target_peer = str(speakers[speaker_index + 1].get("name", "")).strip()
+                else:
+                    target_peer = "你（學生團體成員）"
+            else:
+                target_peer = peer_target(speaker, context)
             try:
                 with st.spinner(f"{speaker['name']} 正在回應…"):
                     generate_actor_reply(context, speaker, target_peer)
