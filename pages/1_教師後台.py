@@ -10,17 +10,11 @@ import zipfile
 import pandas as pd
 import streamlit as st
 
+from src.config import load_config
 from src.data_manager import InMemoryStore, SHEET_HEADERS, create_store
 
 
 st.set_page_config(page_title="團體諮商 Agent 教師後台", page_icon="📊", layout="wide")
-
-
-def section(name: str) -> dict:
-    try:
-        return dict(st.secrets.get(name, {}))
-    except Exception:
-        return {}
 
 
 @st.cache_resource
@@ -47,21 +41,43 @@ def all_tables_zip(store) -> bytes:
     return output.getvalue()
 
 
-app_settings = section("app")
-admin_passcode = str(app_settings.get("admin_passcode", ""))
+config = load_config(st.secrets)
+admin_passcode = config.admin_passcode
+verified_email = str(st.session_state.get("verified_email", "")).strip().lower()
+is_email_verified = bool(st.session_state.get("authenticated")) and bool(verified_email)
+is_authorized_teacher = verified_email in set(config.admin_emails)
+
 if "admin_authenticated" not in st.session_state:
+    st.session_state.admin_authenticated = False
+if st.session_state.get("admin_authenticated_email") != verified_email:
     st.session_state.admin_authenticated = False
 
 st.title("📊 團體諮商 Agent 教師後台")
+
+if not config.admin_emails:
+    st.error("尚未在 Streamlit Secrets 設定 app.admin_emails，教師後台已鎖定。")
+    st.stop()
+
+if not is_email_verified:
+    st.warning("請先回到主程式，以教師 Email 完成 OTP 驗證。")
+    st.page_link("app.py", label="回到主程式登入", icon="🔐")
+    st.stop()
+
+if not is_authorized_teacher:
+    st.error(f"帳號 {verified_email} 沒有教師後台權限。")
+    st.stop()
+
 if not admin_passcode:
     st.error("尚未在 Streamlit Secrets 設定 app.admin_passcode，教師後台已鎖定。")
     st.stop()
 
 if not st.session_state.admin_authenticated:
+    st.caption(f"已驗證教師帳號：{verified_email}")
     entered = st.text_input("教師後台密碼", type="password")
     if st.button("登入教師後台", type="primary"):
         if hmac.compare_digest(entered, admin_passcode):
             st.session_state.admin_authenticated = True
+            st.session_state.admin_authenticated_email = verified_email
             st.rerun()
         st.error("密碼不正確。")
     st.stop()
@@ -103,4 +119,5 @@ st.download_button(
 
 if st.button("登出教師後台"):
     st.session_state.admin_authenticated = False
+    st.session_state.admin_authenticated_email = ""
     st.rerun()
