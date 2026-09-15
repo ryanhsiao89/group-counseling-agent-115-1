@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import threading
 from collections import defaultdict
+from datetime import datetime
 from typing import Any, Mapping
 
 from .models import next_stage
@@ -99,6 +100,160 @@ def summarize_completed_usage(
     }
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def reconcile_usage(
+    session_rows: list[dict[str, Any]],
+    chat_rows: list[dict[str, Any]],
+    participant_id: str,
+    *,
+    idle_gap_cap_seconds: int = 300,
+) -> dict[str, int]:
+    """以 session_id 勾稽 Sessions 與 ChatLogs，回傳可稽核的累積時間。
+
+    完整 completed Session 以 duration_seconds 為準。缺少完成紀錄時，若
+    ChatLogs 至少有一筆學生發言，便以相鄰訊息時間差補算；每段間隔最多
+    計入 idle_gap_cap_seconds，避免長時間閒置造成高估。abandoned 不補算。
+    """
+    participant_id = str(participant_id)
+    cap = max(1, int(idle_gap_cap_seconds))
+    sessions: dict[str, dict[str, Any]] = {}
+
+    for row in session_rows:
+        if str(row.get("participant_id", "")) != participant_id:
+            continue
+        session_id = str(row.get("session_id", "")).strip()
+        if not session_id:
+            continue
+        item = sessions.setdefault(
+            session_id,
+            {
+                "role_mode": "",
+                "started_at": None,
+                "completed_seconds": None,
+                "completed": False,
+                "abandoned": False,
+            },
+        )
+        role_mode = str(row.get("role_mode", "")).strip().lower()
+        if role_mode in {"leader", "member"}:
+            item["role_mode"] = role_mode
+        started_at = _parse_timestamp(row.get("started_at"))
+        if started_at and (item["started_at"] is None or started_at < item["started_at"]):
+            item["started_at"] = started_at
+
+        if str(row.get("event_type", "")).strip().lower() != "end":
+            continue
+        status = str(row.get("completion_status", "")).strip().lower()
+        if status == "completed":
+            item["completed"] = True
+            try:
+                duration = max(0, int(float(row.get("duration_seconds", 0) or 0)))
+            except (TypeError, ValueError):
+                duration = 0
+            previous = item["completed_seconds"]
+            if previous is None or duration > previous:
+                item["completed_seconds"] = duration
+        elif status == "abandoned":
+            item["abandoned"] = True
+
+    logs_by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in chat_rows:
+        if str(row.get("participant_id", "")) != participant_id:
+            continue
+        session_id = str(row.get("session_id", "")).strip()
+        if session_id:
+            logs_by_session[session_id].append(row)
+
+    total_seconds = 0
+    leader_seconds = 0
+    member_seconds = 0
+    completed_sessions = 0
+    recovered_sessions = 0
+    recovered_seconds = 0
+    counted_sessions = 0
+
+    for session_id in set(sessions) | set(logs_by_session):
+        item = sessions.get(
+            session_id,
+            {
+                "role_mode": "",
+                "started_at": None,
+                "completed_seconds": None,
+                "completed": False,
+                "abandoned": False,
+            },
+        )
+        logs = logs_by_session.get(session_id, [])
+        role_mode = str(item.get("role_mode", ""))
+        if role_mode not in {"leader", "member"}:
+            role_mode = next(
+                (
+                    str(row.get("role_mode", "")).strip().lower()
+                    for row in logs
+                    if str(row.get("role_mode", "")).strip().lower() in {"leader", "member"}
+                ),
+                "",
+            )
+
+        seconds = 0
+        recovered = False
+        completed_seconds = item.get("completed_seconds")
+        if item.get("completed") and completed_seconds is not None and completed_seconds > 0:
+            seconds = int(completed_seconds)
+            completed_sessions += 1
+        elif not item.get("abandoned"):
+            has_student_turn = any(
+                str(row.get("speaker_role", "")).strip().lower().startswith("student_")
+                for row in logs
+            )
+            timestamps = sorted(
+                timestamp
+                for timestamp in (_parse_timestamp(row.get("timestamp")) for row in logs)
+                if timestamp is not None
+            )
+            if has_student_turn and timestamps:
+                points = list(timestamps)
+                started_at = item.get("started_at")
+                if started_at is not None and started_at <= points[0]:
+                    points.insert(0, started_at)
+                seconds = sum(
+                    min(cap, max(0, int((later - earlier).total_seconds())))
+                    for earlier, later in zip(points, points[1:])
+                )
+                recovered = seconds > 0
+
+        if item.get("completed") and completed_seconds is not None and completed_seconds <= 0:
+            completed_sessions += 1
+        if seconds <= 0:
+            continue
+
+        counted_sessions += 1
+        total_seconds += seconds
+        if role_mode == "leader":
+            leader_seconds += seconds
+        elif role_mode == "member":
+            member_seconds += seconds
+        if recovered:
+            recovered_sessions += 1
+            recovered_seconds += seconds
+
+    return {
+        "total_seconds": total_seconds,
+        "leader_seconds": leader_seconds,
+        "member_seconds": member_seconds,
+        "completed_sessions": completed_sessions,
+        "recovered_sessions": recovered_sessions,
+        "recovered_seconds": recovered_seconds,
+        "counted_sessions": counted_sessions,
+    }
+
+
 class BaseStore:
     persistent = False
 
@@ -129,7 +284,11 @@ class BaseStore:
         self.append("SeriesStates", payload)
 
     def usage_summary_for(self, participant_id: str) -> dict[str, int]:
-        return summarize_completed_usage(self.records("Sessions"), participant_id)
+        return reconcile_usage(
+            self.records("Sessions"),
+            self.records("ChatLogs"),
+            participant_id,
+        )
 
     def continuations_for(self, participant_id: str) -> list[dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}
