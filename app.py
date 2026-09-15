@@ -69,6 +69,9 @@ def get_store():
 
 STORE, STORE_ERROR = get_store()
 
+SEMESTER_TARGET_MINUTES = 120
+LEADER_TARGET_MINUTES = 60
+
 
 DEFAULT_STATE = {
     "authenticated": False,
@@ -91,6 +94,8 @@ DEFAULT_STATE = {
     "pending_ai_reply": None,
     "active_model_name": "",
     "last_series_state": None,
+    "usage_summary": None,
+    "usage_error": "",
 }
 
 
@@ -101,6 +106,78 @@ def init_state() -> None:
 
 
 init_state()
+
+
+def get_usage_summary(*, force_refresh: bool = False) -> dict[str, int]:
+    if force_refresh or st.session_state.usage_summary is None:
+        try:
+            st.session_state.usage_summary = STORE.usage_summary_for(
+                st.session_state.participant_id
+            )
+            st.session_state.usage_error = ""
+        except Exception as error:
+            st.session_state.usage_summary = {
+                "total_seconds": 0,
+                "leader_seconds": 0,
+                "member_seconds": 0,
+                "completed_sessions": 0,
+            }
+            st.session_state.usage_error = str(error)
+    return dict(st.session_state.usage_summary)
+
+
+def minutes_text(seconds: int) -> str:
+    return f"{seconds / 60:.1f} 分鐘"
+
+
+def render_semester_progress(*, compact: bool = False, force_refresh: bool = False) -> None:
+    usage = get_usage_summary(force_refresh=force_refresh)
+    total_seconds = int(usage.get("total_seconds", 0))
+    leader_seconds = int(usage.get("leader_seconds", 0))
+    member_seconds = int(usage.get("member_seconds", 0))
+    total_target_seconds = SEMESTER_TARGET_MINUTES * 60
+    leader_target_seconds = LEADER_TARGET_MINUTES * 60
+
+    if compact:
+        st.subheader("📈 本學期累積")
+        st.write(f"**總時數：** {minutes_text(total_seconds)}／{SEMESTER_TARGET_MINUTES} 分鐘")
+        st.progress(min(1.0, total_seconds / total_target_seconds))
+        st.write(f"**Leader：** {minutes_text(leader_seconds)}／{LEADER_TARGET_MINUTES} 分鐘")
+        st.progress(min(1.0, leader_seconds / leader_target_seconds))
+        st.caption("本次練習完成後，實際使用時間才會加入累積。")
+        return
+
+    st.subheader("📈 本學期上機進度")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("總累積", minutes_text(total_seconds))
+    col2.metric("Leader 累積", minutes_text(leader_seconds))
+    col3.metric("Member 累積", minutes_text(member_seconds))
+    st.progress(
+        min(1.0, total_seconds / total_target_seconds),
+        text=f"總時數目標：{minutes_text(total_seconds)}／{SEMESTER_TARGET_MINUTES} 分鐘",
+    )
+    st.progress(
+        min(1.0, leader_seconds / leader_target_seconds),
+        text=f"Leader 目標：{minutes_text(leader_seconds)}／{LEADER_TARGET_MINUTES} 分鐘",
+    )
+
+    total_remaining = max(0, total_target_seconds - total_seconds)
+    leader_remaining = max(0, leader_target_seconds - leader_seconds)
+    if total_remaining == 0 and leader_remaining == 0:
+        st.success("已達成本學期 120 分鐘總時數，且 Leader 累積至少 60 分鐘。")
+    else:
+        messages = []
+        if total_remaining:
+            messages.append(f"總時數尚差約 {(total_remaining + 59) // 60} 分鐘")
+        if leader_remaining:
+            messages.append(f"Leader 尚差約 {(leader_remaining + 59) // 60} 分鐘")
+        st.info("；".join(messages) + "。")
+    st.caption(
+        f"目前共完成 {int(usage.get('completed_sessions', 0))} 個練習階段；"
+        "僅計入已完成並成功保存的練習。"
+    )
+    if st.session_state.usage_error:
+        st.warning(f"暫時無法讀取累積時數：{st.session_state.usage_error}")
 
 
 def context_obj() -> PracticeContext:
@@ -157,68 +234,6 @@ def append_and_log(context: PracticeContext, turn: dict[str, Any]) -> None:
     log_turn(context, turn)
 
 
-def _member_mode_speakers(
-    context: PracticeContext,
-    user_text: str,
-    turns: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Member 體驗模式的發言編排：AI Leader 必須持續承擔帶領責任。"""
-    lowered = user_text.strip().lower()
-
-    # 學生明確叫 Leader／帶領者時，由 AI Leader 立即接手。
-    leader_tokens = ("leader", "ai leader", "帶領者", "團體帶領者", "主持人")
-    if any(token in lowered for token in leader_tokens):
-        return [AI_LEADER]
-
-    # 學生直接點名某位 AI 成員時：該成員先回應，Leader 隨後統整／串聯。
-    named_member = None
-    for participant in context.participants:
-        name = str(participant.get("name", "")).strip()
-        participant_id = str(participant.get("id", "")).strip()
-        if (name and name.lower() in lowered) or (participant_id and participant_id.lower() in lowered):
-            named_member = participant
-            break
-    if named_member is not None:
-        return [named_member, AI_LEADER]
-
-    # 找上一位 AI 發言者。
-    last_ai_id = ""
-    for turn in reversed(turns):
-        if str(turn.get("speaker_role", "")).startswith("ai_"):
-            last_ai_id = str(turn.get("speaker_id", ""))
-            break
-
-    # 優先讓「最久沒說話」的 AI 成員取得發言機會，避免固定同一人。
-    def recency_score(participant: dict[str, Any]) -> int:
-        pid = str(participant.get("id", ""))
-        for distance, turn in enumerate(reversed(turns)):
-            if str(turn.get("speaker_id", "")) == pid:
-                return distance
-        return 10**6
-
-    ordered_members = sorted(
-        list(context.participants),
-        key=recency_score,
-        reverse=True,
-    )
-    candidate = ordered_members[0] if ordered_members else None
-
-    # 若上一位 AI 是 Leader，先讓一位成員說，再由 Leader 收束並繼續帶領。
-    if last_ai_id == "ai_leader" and candidate is not None:
-        return [candidate, AI_LEADER]
-
-    # 開始期也要讓 AI 成員實際參與，不讓 Student Member 變成唯一焦點。
-    # 先由最久未發言的 AI 成員回應，再由 Leader 串聯與分配下一輪焦點。
-    if context.stage == "opening":
-        return [candidate, AI_LEADER] if candidate is not None else [AI_LEADER]
-
-    # 形成／工作／結束期：Leader 先做歷程介入，再邀請一名成員回應，
-    # 讓學生能實際體驗成員間互動，而不是多個平行的個別對話。
-    if candidate is not None:
-        return [AI_LEADER, candidate]
-    return [AI_LEADER]
-
-
 def start_practice(context: PracticeContext, keys: list[str]) -> None:
     reset_practice()
     save_context(context)
@@ -255,77 +270,8 @@ def start_practice(context: PracticeContext, keys: list[str]) -> None:
     append_and_log(context, system_turn)
 
 
-
-def _student_wants_less_focus(user_text: str) -> bool:
-    """學生明確表示暫不發言／希望轉給別人時，Leader 不再追問學生。"""
-    text = user_text.strip().lower()
-    markers = (
-        "先不說", "不想說", "不說了", "我不說", "不要問我", "不要再問我",
-        "別問我", "換別人", "請別人", "讓別人", "給別人", "別人說",
-        "不要一直問", "不要一直點", "怎麼又換我", "怎麼又是我",
-        "怎麼又把焦點放我", "先聽", "我先聽", "旁邊聽",
-    )
-    return any(marker in text for marker in markers)
-
-
-def _least_recent_ai_member(context: PracticeContext, turns: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """找最久沒有發言的 AI 成員，讓邀請焦點不要集中在固定同一人。"""
-    if not context.participants:
-        return None
-
-    def recency_score(participant: dict[str, Any]) -> int:
-        pid = str(participant.get("id", ""))
-        for distance, turn in enumerate(reversed(turns)):
-            if str(turn.get("speaker_id", "")) == pid:
-                return distance
-        return 10**6
-
-    return max(context.participants, key=recency_score)
-
-
-def _member_mode_leader_target(
-    context: PracticeContext,
-    turns: list[dict[str, Any]],
-    user_text: str,
-    next_speaker: dict[str, Any] | None = None,
-) -> str:
-    """決定 AI Leader 下一個邀請對象。
-
-    原則：
-    1. Student Member 是團體中的一員，不是預設焦點。
-    2. 若本輪後面已排 AI 成員，Leader 直接把話交給該成員。
-    3. 學生明確表示暫不發言時，至少本輪完全不再追問學生。
-    4. 其餘情況採約 2:1 的 AI 成員：學生邀請比例，並優先最久未發言的 AI 成員。
-    """
-    if next_speaker is not None:
-        return str(next_speaker.get("name", "")).strip()
-
-    ai_member = _least_recent_ai_member(context, turns)
-    ai_member_name = str(ai_member.get("name", "")).strip() if ai_member else ""
-
-    if _student_wants_less_focus(user_text):
-        return ai_member_name or "其他團體成員"
-
-    leader_turn_count = sum(
-        1
-        for turn in turns
-        if str(turn.get("speaker_id", "")) == "ai_leader"
-        and str(turn.get("speaker_role", "")).startswith("ai_")
-    )
-
-    # 每三次 Leader 邀請中，大約一次回到 Student Member；
-    # 另外兩次優先邀請 AI 成員，避免學生一直成為焦點。
-    if leader_turn_count % 3 == 2:
-        return "你（學生團體成員）"
-
-    return ai_member_name or "你（學生團體成員）"
-
-
 def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], target_peer: str = "") -> None:
     pool: GeminiKeyPool = st.session_state.api_pool
-
-    is_member_mode_leader = context.role_mode == "member" and speaker.get("id") == "ai_leader"
-
     system_prompt, user_prompt = build_dialogue_prompts(
         role_mode=context.role_mode,
         speaker=speaker,
@@ -340,71 +286,7 @@ def generate_actor_reply(context: PracticeContext, speaker: dict[str, Any], targ
         recent_turns=st.session_state.turns[-CONFIG.max_recent_messages :],
         target_peer_name=target_peer,
     )
-
-    system_prompt += """
-
-【括號內文字＝非語言訊息】
-學生輸入中，半形括號 (...) 或全形括號（...）內的文字，一律視為「非語言行為／姿態／沉默／視線／表情／動作」，不是學生實際說出口的話。
-例如：
-- （安靜等待他人發言）
-- （點頭）
-- （看向心妤）
-- （沉默幾秒）
-- （微笑但沒有接話）
-
-回應規則：
-1. 不要把括號內文字當成口語內容引用，不可說「你剛才說『安靜等待他人發言』」。
-2. 可以依該非語言線索調整團體歷程，例如尊重沉默、注意視線、把發言機會交給其他成員、回應情緒氣氛。
-3. 若括號訊息表示學生暫時不想說話、等待、沉默或把空間留給別人，不要立刻追問學生；優先讓其他成員參與或由 Leader 容納短暫沉默。
-4. 若一句輸入同時有口語與括號動作，口語是實際發言，括號是補充的非語言脈絡。
-""".strip()
-
-    if is_member_mode_leader:
-        stage_task = {
-            "opening": (
-                "開始期：主動建立安全感與方向，簡短說明此刻團體要做什麼，"
-                "邀請成員自我介紹、表達期待或說出目前最想談的一件事；"
-                "注意讓學生與其他成員都有進入團體的機會。"
-            ),
-            "formation": (
-                "形成期：主動注意沉默、觀望、競爭、防衛與參與差異；"
-                "適度正常化猶豫，邀請較少發言者，也可詢問不同意見。"
-            ),
-            "working": (
-                "工作期：主動深化核心情緒與此時此刻經驗，辨識共同性、差異、支持或張力，"
-                "並促進成員直接回應彼此，而不是所有話都只對 Leader 說。"
-            ),
-            "ending": (
-                "結束期：主動整合本次收穫，邀請彼此回饋、離別或未竟感受，"
-                "並連結到團體外可帶走的行動或意義。"
-            ),
-        }.get(context.stage, "依目前團體階段主動維持團體歷程。")
-
-        system_prompt += f"""
-
-【Member 模式：AI 團體帶領者的主動帶領責任】
-你不是等待被點名才說話的成員，而是本團體的帶領者。
-每次輪到你，都要先接住上一位發言者的核心內容或情緒，再主動完成至少一項團體歷程工作：
-澄清焦點、邀請較少發言者、連結兩位成員的共同／不同經驗、促進成員互相回應、
-整理目前團體正在發生的事，或依階段推進下一步。
-不要只是回答學生的問題，也不要等學生提醒「Leader 你要不要說些什麼」。
-
-【邀請焦點分配】
-- Student Member 只是團體成員之一，不是預設焦點，也不是每一輪都必須被追問的人。
-- 要主動把發言機會平均分散到 Student Member 與各 AI 成員；不要連續兩次以上把問題丟給 Student Member。
-- 若 Student Member 剛發言，通常先把話交給另一位 AI 成員，除非他的內容明確需要立即澄清。
-- 若某位 AI 成員較少發言，要主動邀請他，而不是一直問同一個人。
-- 可以使用「剛才心妤提到……承翰聽到這裡怎麼想？」或「這裡好像有兩種不同感受，芷寧你有沒有注意到什麼？」之類的橫向串聯。
-- 若 Student Member 明確說「先不說」、「換別人」、「不要再問我」或同等意思，立刻尊重；不要再追問他是否舒服、是否放鬆、是否願意說，也不要用另一個問題把焦點繞回他。至少先讓一到兩位其他成員發言後，再視團體脈絡決定是否自然開放邀請。
-- 當成員拒絕發言時，可簡短確認「可以，你先聽就好」，然後立刻把焦點轉向其他成員或整個團體。
-
-每次以一個清楚焦點為主，避免連珠炮式盤問；通常以一個自然、開放、可回應的邀請收尾。
-若指定邀請對象為「{target_peer}」，請讓最後一句自然地把話交給該對象。
-若剛才是一位 AI 成員回應學生，請先簡短反映／串聯，再把討論擴回整個團體，而不是重複該成員原話。
-本階段特別任務：{stage_task}
-""".strip()
-
-    result = pool.generate(system_prompt, user_prompt, temperature=0.4, max_output_tokens=1200)
+    result = pool.generate(system_prompt, user_prompt, temperature=0.4, max_output_tokens=600)
     st.session_state.active_model_name = result.model_name
     speaker_role = "ai_leader" if speaker["id"] == "ai_leader" else "ai_group_member"
     turn = add_turn(
@@ -538,6 +420,7 @@ def safe_finish_practice(context: PracticeContext) -> None:
             "duration_seconds": seconds_since(context.started_at_epoch),
             "completion_status": "completed",
         })
+        st.session_state.usage_summary = None
         series_state = make_series_state(
             group_series_id=context.group_series_id,
             participant_id=context.participant_id,
@@ -647,6 +530,8 @@ def render_setup() -> None:
         detail = f"（{STORE_ERROR}）" if STORE_ERROR else ""
         st.warning(f"Google Sheets 尚未連線{detail}。本次可測試，但跨瀏覽器續談與永久紀錄不會保存。")
 
+    render_semester_progress()
+
     try:
         continuations = STORE.continuations_for(st.session_state.participant_id)
     except Exception as error:
@@ -752,6 +637,7 @@ def render_setup() -> None:
 def render_feedback(context: PracticeContext) -> None:
     assessment = st.session_state.assessment
     st.success("本階段已完成，逐字稿、階段摘要與形成性回饋已送出。")
+    render_semester_progress(force_refresh=True)
     transcript = build_transcript(context, st.session_state.turns)
     filename = (
         f"GroupCounseling_{context.role_mode}_{context.stage}_"
@@ -833,6 +719,7 @@ def render_practice() -> None:
             st.info("主要模型忙碌，系統已自動切換備援模型，練習可繼續。")
         elapsed = seconds_since(context.started_at_epoch)
         st.metric("已進行", f"{elapsed // 60:02d}:{elapsed % 60:02d}")
+        render_semester_progress(compact=True)
         if context.duration_target_minutes:
             target_seconds = context.duration_target_minutes * 60
             st.progress(min(1.0, elapsed / target_seconds))
@@ -871,10 +758,6 @@ def render_practice() -> None:
         f"{context.school_name}"
     )
     st.info("請勿輸入真實個案的姓名、電話、地址、學號或可辨識的學校／公司資訊。")
-    st.caption(
-        "互動提示：若要表達非語言行為，可使用括號，例如 "
-        "（安靜等待他人發言）、（點頭）、（看向心妤）。"
-    )
 
     display_people = context.participants if context.role_mode == "leader" else [AI_LEADER, *context.participants]
     columns = st.columns(len(display_people))
@@ -951,16 +834,7 @@ def render_practice() -> None:
     cooldown_left = max(0, CONFIG.input_cooldown_seconds - int(time.time() - st.session_state.last_submit_at))
     if cooldown_left > 0:
         st.caption(f"請稍候約 {cooldown_left} 秒再送出下一段。")
-
-    st.caption(
-        "💡 可用括號輸入非語言訊息，例如："
-        "（安靜等待他人發言）、（點頭）、（看向某位成員）、（沉默幾秒）。"
-        "括號內內容會被 AI 視為動作／姿態，而不是你說出口的話。"
-    )
-
-    user_input = st.chat_input(
-        f"輸入你的回應（最多 {CONFIG.max_user_input_chars} 字）；非語言訊息可寫在（括號）內"
-    )
+    user_input = st.chat_input(f"輸入你的回應（最多 {CONFIG.max_user_input_chars} 字）")
     if user_input:
         text = user_input.strip()
         if not text:
@@ -1001,22 +875,9 @@ def render_practice() -> None:
             append_and_log(context, safety_turn)
             st.rerun()
 
-        if context.role_mode == "member":
-            speakers = _member_mode_speakers(context, text, st.session_state.turns)
-        else:
-            speakers = choose_speakers(context, text, st.session_state.turns)
-
-        for speaker_index, speaker in enumerate(speakers):
-            if context.role_mode == "member" and speaker.get("id") == "ai_leader":
-                next_speaker = speakers[speaker_index + 1] if speaker_index + 1 < len(speakers) else None
-                target_peer = _member_mode_leader_target(
-                    context,
-                    st.session_state.turns,
-                    text,
-                    next_speaker=next_speaker,
-                )
-            else:
-                target_peer = peer_target(speaker, context)
+        speakers = choose_speakers(context, text, st.session_state.turns)
+        for speaker in speakers:
+            target_peer = peer_target(speaker, context)
             try:
                 with st.spinner(f"{speaker['name']} 正在回應…"):
                     generate_actor_reply(context, speaker, target_peer)
