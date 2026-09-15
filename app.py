@@ -57,17 +57,19 @@ def secret_section(name: str) -> dict[str, Any]:
 
 
 CONFIG = load_config(st.secrets)
+STORE_CACHE_VERSION = "usage-reconcile-v1.5"
 
 
 @st.cache_resource
-def get_store():
+def get_store(cache_version: str):
+    del cache_version  # 只用來在資料層更新時建立新的快取版本。
     try:
         return create_store(st.secrets), ""
     except Exception as error:
         return InMemoryStore(), str(error)
 
 
-STORE, STORE_ERROR = get_store()
+STORE, STORE_ERROR = get_store(STORE_CACHE_VERSION)
 
 SEMESTER_TARGET_MINUTES = 120
 LEADER_TARGET_MINUTES = 60
@@ -121,6 +123,9 @@ def get_usage_summary(*, force_refresh: bool = False) -> dict[str, int]:
                 "leader_seconds": 0,
                 "member_seconds": 0,
                 "completed_sessions": 0,
+                "recovered_sessions": 0,
+                "recovered_seconds": 0,
+                "counted_sessions": 0,
             }
             st.session_state.usage_error = str(error)
     return dict(st.session_state.usage_summary)
@@ -135,6 +140,7 @@ def render_semester_progress(*, compact: bool = False, force_refresh: bool = Fal
     total_seconds = int(usage.get("total_seconds", 0))
     leader_seconds = int(usage.get("leader_seconds", 0))
     member_seconds = int(usage.get("member_seconds", 0))
+    recovered_seconds = int(usage.get("recovered_seconds", 0))
     total_target_seconds = SEMESTER_TARGET_MINUTES * 60
     leader_target_seconds = LEADER_TARGET_MINUTES * 60
 
@@ -144,7 +150,10 @@ def render_semester_progress(*, compact: bool = False, force_refresh: bool = Fal
         st.progress(min(1.0, total_seconds / total_target_seconds))
         st.write(f"**Leader：** {minutes_text(leader_seconds)}／{LEADER_TARGET_MINUTES} 分鐘")
         st.progress(min(1.0, leader_seconds / leader_target_seconds))
-        st.caption("本次練習完成後，實際使用時間才會加入累積。")
+        if recovered_seconds:
+            st.caption(f"其中 {minutes_text(recovered_seconds)}由對話紀錄勾稽補算。")
+        else:
+            st.caption("本次練習完成後，實際使用時間會加入累積。")
         return
 
     st.subheader("📈 本學期上機進度")
@@ -173,9 +182,15 @@ def render_semester_progress(*, compact: bool = False, force_refresh: bool = Fal
             messages.append(f"Leader 尚差約 {(leader_remaining + 59) // 60} 分鐘")
         st.info("；".join(messages) + "。")
     st.caption(
-        f"目前共完成 {int(usage.get('completed_sessions', 0))} 個練習階段；"
-        "僅計入已完成並成功保存的練習。"
+        f"目前納入 {int(usage.get('counted_sessions', 0))} 個練習階段；"
+        f"其中完整結束 {int(usage.get('completed_sessions', 0))} 個、"
+        f"由對話紀錄補算 {int(usage.get('recovered_sessions', 0))} 個。"
     )
+    if recovered_seconds:
+        st.info(
+            f"其中 {minutes_text(recovered_seconds)}來自 Sessions 與 ChatLogs 勾稽補算；"
+            "僅採計有學生實際發言的可驗證互動時間。"
+        )
     if st.session_state.usage_error:
         st.warning(f"暫時無法讀取累積時數：{st.session_state.usage_error}")
 
