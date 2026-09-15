@@ -58,6 +58,47 @@ def _cell(value: Any) -> Any:
     return value
 
 
+def summarize_completed_usage(
+    rows: list[dict[str, Any]], participant_id: str
+) -> dict[str, int]:
+    """統計學生已完成練習的有效累積秒數，並避免重複計入同一 Session。"""
+    completed_sessions: dict[str, tuple[int, str]] = {}
+    for row in rows:
+        if str(row.get("participant_id", "")) != participant_id:
+            continue
+        if str(row.get("event_type", "")).strip().lower() != "end":
+            continue
+        if str(row.get("completion_status", "")).strip().lower() != "completed":
+            continue
+
+        session_id = str(row.get("session_id", "")).strip()
+        if not session_id:
+            continue
+        try:
+            duration_seconds = max(0, int(float(row.get("duration_seconds", 0) or 0)))
+        except (TypeError, ValueError):
+            duration_seconds = 0
+        role_mode = str(row.get("role_mode", "")).strip().lower()
+
+        previous = completed_sessions.get(session_id)
+        if previous is None or duration_seconds > previous[0]:
+            completed_sessions[session_id] = (duration_seconds, role_mode)
+
+    total_seconds = sum(item[0] for item in completed_sessions.values())
+    leader_seconds = sum(
+        duration for duration, role_mode in completed_sessions.values() if role_mode == "leader"
+    )
+    member_seconds = sum(
+        duration for duration, role_mode in completed_sessions.values() if role_mode == "member"
+    )
+    return {
+        "total_seconds": total_seconds,
+        "leader_seconds": leader_seconds,
+        "member_seconds": member_seconds,
+        "completed_sessions": len(completed_sessions),
+    }
+
+
 class BaseStore:
     persistent = False
 
@@ -86,6 +127,9 @@ class BaseStore:
     def append_series_state(self, record: Mapping[str, Any]) -> None:
         payload = {"state_id": new_id("state"), **record}
         self.append("SeriesStates", payload)
+
+    def usage_summary_for(self, participant_id: str) -> dict[str, int]:
+        return summarize_completed_usage(self.records("Sessions"), participant_id)
 
     def continuations_for(self, participant_id: str) -> list[dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}
@@ -204,7 +248,13 @@ def create_store(secrets: Mapping[str, Any] | None) -> BaseStore:
     ).strip()
 
     service_account = dict(secrets.get("gcp_service_account", {}))
-    legacy_json = secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    # 除了正式的最外層設定，也容許使用者誤把舊版 JSON 放在
+    # [google_sheets] 之下；Streamlit/TOML 初次設定時很容易發生這種情況。
+    legacy_json = (
+        secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        or settings.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        or settings.get("service_account_json", "")
+    )
     if not service_account and legacy_json:
         if isinstance(legacy_json, str):
             try:
@@ -219,9 +269,55 @@ def create_store(secrets: Mapping[str, Any] | None) -> BaseStore:
         else:
             service_account = dict(legacy_json)
 
-    if spreadsheet_id and service_account:
-        return GoogleSheetsStore(spreadsheet_id, service_account)
-    return InMemoryStore()
+    # 亦支援直接把服務帳戶欄位寫在 [google_sheets] 內。只擷取 Google
+    # 憑證欄位，避免把 spreadsheet_id 一併傳給 google-auth。
+    if not service_account:
+        credential_keys = {
+            "type",
+            "project_id",
+            "private_key_id",
+            "private_key",
+            "client_email",
+            "client_id",
+            "auth_uri",
+            "token_uri",
+            "auth_provider_x509_cert_url",
+            "client_x509_cert_url",
+            "universe_domain",
+        }
+        nested_credentials = {
+            key: settings[key]
+            for key in credential_keys
+            if key in settings and str(settings[key]).strip()
+        }
+        if nested_credentials:
+            service_account = nested_credentials
+
+    # 完全沒有設定時保留測試用記憶體模式；只要使用者已設定其中一部分，
+    # 就回報可操作且不洩漏憑證內容的明確錯誤。
+    if not spreadsheet_id and not service_account:
+        if not secrets:
+            return InMemoryStore()
+        raise ValueError(
+            "Secrets 未讀到 Google Sheets 設定：請確認 [google_sheets] 的 "
+            "spreadsheet_id，以及最外層 GOOGLE_SERVICE_ACCOUNT_JSON。"
+        )
+    if not spreadsheet_id:
+        raise ValueError("Secrets 已讀到服務帳戶，但缺少 [google_sheets] spreadsheet_id。")
+    if not service_account:
+        raise ValueError(
+            "Secrets 已讀到 spreadsheet_id，但未讀到服務帳戶；請把 "
+            "GOOGLE_SERVICE_ACCOUNT_JSON 放在任何 [區段] 之前。"
+        )
+
+    required_keys = ("type", "project_id", "private_key", "client_email", "token_uri")
+    missing_keys = [key for key in required_keys if not str(service_account.get(key, "")).strip()]
+    if missing_keys:
+        raise ValueError(
+            "Google 服務帳戶資料不完整，缺少欄位：" + ", ".join(missing_keys)
+        )
+
+    return GoogleSheetsStore(spreadsheet_id, service_account)
 
 
 def make_series_state(
